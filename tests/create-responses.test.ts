@@ -47,8 +47,8 @@ function bodyToString(body: unknown): string {
   return body
 }
 
-test("strips old Responses images when payload exceeds upstream byte limit", async () => {
-  const imageUrl = `data:image/png;base64,${"a".repeat(1_000_000)}`
+test("strips old Responses images when payload exceeds the default 10 MB limit", async () => {
+  const imageUrl = `data:image/png;base64,${"a".repeat(2_000_000)}`
   const payload: ResponsesApiRequest = {
     model: "unknown-vision-model",
     input: Array.from({ length: 6 }, (_, index) => ({
@@ -63,7 +63,7 @@ test("strips old Responses images when payload exceeds upstream byte limit", asy
   const fetchMock = mock((_url: string, opts: RequestInit) => {
     const body = bodyToString(opts.body)
     return new Response(JSON.stringify({ id: "resp_123" }), {
-      status: body.length > 5_000_000 ? 413 : 200,
+      status: body.length > 10_000_000 ? 413 : 200,
       headers: { "content-type": "application/json" },
     })
   })
@@ -74,7 +74,7 @@ test("strips old Responses images when payload exceeds upstream byte limit", asy
   const forwarded = JSON.parse(sentBody) as ResponsesApiRequest
 
   expect(response.status).toBe(200)
-  expect(sentBody.length).toBeLessThanOrEqual(5_000_000)
+  expect(sentBody.length).toBeLessThanOrEqual(10_000_000)
   expect(JSON.stringify(forwarded.input)).toContain(
     "image removed to stay under upstream payload limit",
   )

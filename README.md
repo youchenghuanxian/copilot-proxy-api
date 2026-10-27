@@ -88,9 +88,9 @@ What works:
 - Responses-only models preserve supported `output_config.effort` settings and report output token-limit truncation as `max_tokens`, for both streaming and non-streaming Messages requests.
 - PDF text extraction for `document` blocks ≤ 3 MB. Password-protected PDFs are rejected with a Claude-Code-recognizable error message.
 
-Known gaps (these reflect Copilot's actual capabilities — they are not bugs to file):
+Known gaps and constraints:
 
-- **Hard 2.5 MiB payload ceiling.** The Copilot gateway/backend has an empirically determined hard cliff at exactly 2,621,440 bytes for `claude-opus-4.6-1m`, regardless of the model's claimed 1 M token window. The proxy applies an OpenCode-style context-management pass (prune old tool outputs → strip old base64 images → drop oldest messages) and a 2,500,000-byte backstop before sending. Effective ceiling is ~500 K tokens.
+- **Payload sizing depends on the route and model.** Earlier probing reported failures above 2.5 MiB for `claude-opus-4.6-1m`; this is a historical observation, not a documented universal limit for current Copilot models. The Chat Completions path applies local byte and token estimates when pruning context. The Responses path has a configurable local ceiling described below.
 - **No real prompt cache writes.** Copilot's API exposes a `prompt_tokens_details.cached_tokens` counter that the proxy maps to `cache_read_input_tokens`. There is no `cache_creation_input_tokens` because Copilot doesn't write caches on our behalf. The proxy strips client-supplied `cache_control` markers via translation.
 - **No `thinking` blocks in responses.** Copilot doesn't expose extended thinking. Inbound `thinking` blocks from the assistant turn history are dropped on the request side rather than promoted to text (which would corrupt turn semantics).
 - **No server tools.** `computer_use`, `web_search`, `code_execution`, `text_editor`, `bash`, and other Anthropic-hosted tools are not implemented — Copilot has no equivalents.
@@ -218,6 +218,7 @@ The following command line options are available for the `start` command:
 | --show-token   | Show GitHub and Copilot tokens on fetch and refresh                           | false      | none  |
 | --api-key      | Require one of these comma-separated API keys for proxy routes                | none       | none  |
 | --proxy-env    | Initialize proxy from environment variables                                   | false      | none  |
+| --responses-max-payload-mb | Local Responses payload ceiling in decimal MB (1 MB = 1,000,000 bytes) | 10 | none |
 
 ### Auth Command Options
 
@@ -451,7 +452,15 @@ codex -c model_provider='"openai"'
 - `service_tier` is ChatGPT-plan-specific. Codex may send it, but Copilot's Responses API rejects it, so the proxy strips it before forwarding.
 - Reasoning effort is checked against Copilot's advertised levels when available. Unsupported values return a 400 `unsupported_parameter` error; unknown capabilities are forwarded unchanged.
 - Codex model-catalog refreshes keep Codex's bundled metadata and instructions. Requests with Codex's `client_version` query receive its native empty-catalog shape; ordinary `GET /v1/models` requests still return the full OpenAI-compatible model list.
-- Very large sessions are trimmed before forwarding (oldest input dropped, images replaced with placeholders) to stay under Copilot's payload ceiling. The proxy logs a warning when this happens.
+- Sessions exceeding the local Responses payload ceiling are trimmed before forwarding (oldest input dropped, images replaced with placeholders). The proxy logs a warning when this happens.
+
+The default local Responses ceiling is **10 MB**, measured over the serialized request, including images, text, tools, and conversation history. To override it, for example lowering it to 5 MB when running this checkout:
+
+```sh
+bun run src/main.ts start --responses-max-payload-mb 5
+```
+
+This option applies to `/v1/responses`, including Messages requests translated to Responses. It changes the proxy's local trimming policy; upstream request limits and model token windows still apply, so a larger setting does not guarantee acceptance. GitHub's [Copilot CLI v1.0.74 release](https://github.com/github/copilot-cli/releases/tag/v1.0.74) announced an increased Responses request size limit without publishing the new value.
 
 ### Model-specific settings and reliability
 

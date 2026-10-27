@@ -28,6 +28,7 @@ interface RunServerOptions {
   proxyEnv: boolean
   apiKey?: string
   responsesContextTrim: boolean
+  responsesMaxPayloadBytes: number
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
@@ -51,6 +52,10 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.showToken = options.showToken
   state.localApiKeys = parseLocalApiKeys(options.apiKey)
   state.responsesContextTrim = options.responsesContextTrim
+  state.responsesMaxPayloadBytes = options.responsesMaxPayloadBytes
+  consola.info(
+    `Responses local payload ceiling: ${state.responsesMaxPayloadBytes / 1_000_000} MB (${state.responsesMaxPayloadBytes} bytes)`,
+  )
   if (state.responsesContextTrim) {
     consola.warn(
       "Responses context trimming enabled — old history will be rewritten to fit an estimated budget, which degrades prompt caching",
@@ -220,11 +225,27 @@ export const start = defineCommand({
       description:
         "Trim old /responses history to fit an estimated token budget. Lossy: rewrites conversation history and breaks prompt caching. Off by default — Copilot enforces its own limits",
     },
+    "responses-max-payload-mb": {
+      type: "string",
+      default: "10",
+      description:
+        "Local payload ceiling for /responses in decimal MB (1 MB = 1,000,000 bytes). Copilot's upstream limits still apply",
+    },
   },
   run({ args }) {
     const rateLimitRaw = args["rate-limit"]
     const rateLimit =
       rateLimitRaw === undefined ? undefined : Number.parseInt(rateLimitRaw, 10)
+    const responsesMaxPayloadBytes =
+      Number(args["responses-max-payload-mb"]) * 1_000_000
+    if (
+      !Number.isSafeInteger(responsesMaxPayloadBytes)
+      || responsesMaxPayloadBytes <= 0
+    ) {
+      throw new TypeError(
+        "--responses-max-payload-mb must be a positive number of MB that converts to a safe integer byte count (1 MB = 1,000,000 bytes)",
+      )
+    }
 
     return runServer({
       port: Number.parseInt(args.port, 10),
@@ -239,6 +260,7 @@ export const start = defineCommand({
       proxyEnv: args["proxy-env"],
       apiKey: args["api-key"],
       responsesContextTrim: args["responses-context-trim"],
+      responsesMaxPayloadBytes,
     })
   },
 })

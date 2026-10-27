@@ -1,4 +1,5 @@
 import consola from "consola"
+import { Buffer } from "node:buffer"
 
 import type {
   ResponsesApiRequest,
@@ -10,6 +11,7 @@ import { copilotBaseUrl, copilotHeaders } from "~/lib/api-config"
 import { wrapCancellableResponse } from "~/lib/cancellable-response"
 import { copilotFetch } from "~/lib/copilot-fetch"
 import { HTTPError } from "~/lib/error"
+import { jsonByteLength, truncateJsonString } from "~/lib/json-size"
 import {
   getKnownModelPromptLimit,
   getModelPromptLimit,
@@ -24,13 +26,6 @@ import {
   stripEncryptedOutputParts,
 } from "~/services/copilot/encrypted-output-recovery"
 import { validateResponsesCapabilities } from "~/services/copilot/responses-capabilities"
-
-/**
- * Hard transport ceiling. Azure Front Door rejects bodies above ~5.4 MB before
- * Copilot ever sees them, so trimming to stay under this is not a guess about
- * token accounting — it is a verified wire limit. Enforced unconditionally.
- */
-const MAX_RESPONSES_PAYLOAD_BYTES = 5_000_000
 
 /**
  * Bytes per token for Responses payloads, used only when opt-in token-derived
@@ -103,7 +98,7 @@ export async function createResponses(
     accept: upstreamPayload.stream ? "text/event-stream" : "application/json",
     "X-Initiator": "agent",
   }
-  const bodyLength = JSON.stringify(upstreamPayload).length
+  const bodyLength = jsonByteLength(upstreamPayload)
 
   consola.debug(
     `Sending responses payload: ${bodyLength} bytes, model: ${payload.model}`,
@@ -117,13 +112,14 @@ export async function createResponses(
 
   if (!response.ok) {
     const errorBody = result.errorBody ?? (await response.text())
+    const requestBytes = Buffer.byteLength(result.body, "utf8")
     consola.error(
       `Failed to create responses - Status: ${response.status} ${response.statusText}`,
     )
     consola.error(`Response body: ${errorBody}`)
-    consola.error(`Request payload size: ${result.body.length} bytes`)
+    consola.error(`Request payload size: ${requestBytes} bytes`)
 
-    if (isContextOverflow(response, errorBody, result.body.length)) {
+    if (isContextOverflow(response, errorBody, requestBytes)) {
       const modelCaps = state.models?.data.find((m) => m.id === payload.model)
         ?.capabilities.limits
       const maxOutputTokens = payload.max_output_tokens ?? 0
@@ -133,7 +129,7 @@ export async function createResponses(
       // a bytes/4 guess for upstream's real count makes it compact by the wrong
       // amount. Fall back to the estimate only when upstream gave us nothing.
       const upstream = parseUpstreamTokenCounts(errorBody)
-      const estimatedTokens = upstream.used ?? Math.ceil(result.body.length / 4)
+      const estimatedTokens = upstream.used ?? Math.ceil(requestBytes / 4)
       const modelLimit =
         upstream.limit ?? getModelPromptLimit(payload.model, modelCaps)
       const source = upstream.used ? "upstream-reported" : "estimated"
@@ -271,24 +267,24 @@ function fitResponsesPayload(
   payload: ResponsesApiRequest,
   ceiling: number,
 ): ResponsesApiRequest {
-  const initialBody = JSON.stringify(payload)
-  if (initialBody.length <= ceiling) return payload
+  const initialBytes = jsonByteLength(payload)
+  if (initialBytes <= ceiling) return payload
 
   consola.info(
-    `Responses context fit: payload ${initialBody.length} bytes exceeds ${ceiling} byte ceiling - reducing`,
+    `Responses context fit: payload ${initialBytes} bytes exceeds ${ceiling} byte ceiling - reducing`,
   )
 
   if (typeof payload.input === "string") {
     const current = truncateStringInput(payload, ceiling)
-    const currentBodyLength = JSON.stringify(current).length
+    const currentBodyLength = jsonByteLength(current)
     consola.warn(
-      `Responses context fit: truncated string input (${initialBody.length} -> ${currentBodyLength} bytes)`,
+      `Responses context fit: truncated string input (${initialBytes} -> ${currentBodyLength} bytes)`,
     )
     return current
   }
 
   let current = payload
-  let currentBodyLength = initialBody.length
+  let currentBodyLength = initialBytes
 
   const imageLocations = collectImageLocations(payload)
   let strippedCount = 0
@@ -296,13 +292,13 @@ function fitResponsesPayload(
   for (const location of imageLocations) {
     current = replaceImageWithPlaceholder(current, location)
     strippedCount++
-    currentBodyLength = JSON.stringify(current).length
+    currentBodyLength = jsonByteLength(current)
     if (currentBodyLength <= ceiling) break
   }
 
   if (strippedCount > 0) {
     consola.warn(
-      `Responses context fit: stripped ${strippedCount} images (${initialBody.length} -> ${currentBodyLength} bytes)`,
+      `Responses context fit: stripped ${strippedCount} images (${initialBytes} -> ${currentBodyLength} bytes)`,
     )
   }
 
@@ -310,65 +306,57 @@ function fitResponsesPayload(
 
   const dropped = dropOldInputItems(current, ceiling)
   current = dropOrphanedToolCallOutputs(dropped.payload)
-  currentBodyLength = JSON.stringify(current).length
+  currentBodyLength = jsonByteLength(current)
   if (dropped.count > 0) {
     consola.warn(
-      `Responses context fit: dropped ${dropped.count} old input items (${initialBody.length} -> ${currentBodyLength} bytes)`,
+      `Responses context fit: dropped ${dropped.count} old input items (${initialBytes} -> ${currentBodyLength} bytes)`,
     )
   }
 
   if (currentBodyLength <= ceiling) return current
 
   current = truncateLargestInputContent(current, ceiling)
-  currentBodyLength = JSON.stringify(current).length
+  currentBodyLength = jsonByteLength(current)
   consola.warn(
-    `Responses context fit: truncated input content (${initialBody.length} -> ${currentBodyLength} bytes)`,
+    `Responses context fit: truncated input content (${initialBytes} -> ${currentBodyLength} bytes)`,
   )
 
   if (currentBodyLength <= ceiling) return current
 
   current = minimizeResponsesInput(current, ceiling)
-  currentBodyLength = JSON.stringify(current).length
+  currentBodyLength = jsonByteLength(current)
   consola.warn(
-    `Responses context fit: minimized input history (${initialBody.length} -> ${currentBodyLength} bytes)`,
+    `Responses context fit: minimized input history (${initialBytes} -> ${currentBodyLength} bytes)`,
   )
 
   if (currentBodyLength <= ceiling) return current
 
   current = truncateLargestPayloadStrings(current, ceiling)
-  currentBodyLength = JSON.stringify(current).length
+  currentBodyLength = jsonByteLength(current)
   consola.warn(
-    `Responses context fit: truncated payload strings (${initialBody.length} -> ${currentBodyLength} bytes)`,
+    `Responses context fit: truncated payload strings (${initialBytes} -> ${currentBodyLength} bytes)`,
   )
 
   return current
 }
 
 /**
- * Byte ceiling for the forwarded payload.
- *
- * By default this is the transport ceiling alone: the proxy forwards the
- * client's history verbatim and lets Copilot enforce its own token limits, so
- * a rejection is upstream's real answer rather than a local guess. Rewriting
- * history pre-emptively both discards context Copilot would have accepted and
- * breaks prompt-cache continuity, because `dropOldInputItems` rewrites from the
- * oldest item forward — exactly the stable prefix a cache is keyed on.
- *
- * With `responsesContextTrim` enabled, the smaller token-derived ceiling is
- * applied too, restoring the previous lossy behavior for anyone who wants it.
+ * Configurable local byte budget, independent of the upstream's current limits.
+ * Opt-in token-derived trimming can impose a smaller budget.
  */
 function computeResponsesPayloadCeiling(modelId: string): number {
-  if (!state.responsesContextTrim) return MAX_RESPONSES_PAYLOAD_BYTES
+  const maxPayloadBytes = state.responsesMaxPayloadBytes
+  if (!state.responsesContextTrim) return maxPayloadBytes
 
   const limits = state.models?.data.find((m) => m.id === modelId)?.capabilities
     .limits
   const maxPromptTokens = getKnownModelPromptLimit(modelId, limits)
-  if (!maxPromptTokens) return MAX_RESPONSES_PAYLOAD_BYTES
+  if (!maxPromptTokens) return maxPayloadBytes
 
   const tokenDerivedBytes = Math.floor(
     (maxPromptTokens - TOKEN_RESERVE) * CHARS_PER_TOKEN_ESTIMATE,
   )
-  return Math.min(MAX_RESPONSES_PAYLOAD_BYTES, tokenDerivedBytes)
+  return Math.min(maxPayloadBytes, tokenDerivedBytes)
 }
 
 function truncateStringInput(
@@ -377,15 +365,15 @@ function truncateStringInput(
 ): ResponsesApiRequest {
   if (typeof payload.input !== "string") return payload
 
-  const overhead = JSON.stringify({ ...payload, input: "" }).length
-  const maxInputLength = Math.max(
-    INPUT_TRUNCATED_PREFIX.length,
-    ceiling - overhead,
-  )
-  const tailLength = Math.max(0, maxInputLength - INPUT_TRUNCATED_PREFIX.length)
+  const overhead =
+    jsonByteLength({ ...payload, input: "" }) - jsonByteLength("")
   return {
     ...payload,
-    input: INPUT_TRUNCATED_PREFIX + payload.input.slice(-tailLength),
+    input: truncateJsonString(
+      payload.input,
+      ceiling - overhead,
+      INPUT_TRUNCATED_PREFIX,
+    ),
   }
 }
 
@@ -451,11 +439,11 @@ function dropOldInputItems(
   ceiling: number,
 ): { bodyLength: number; count: number; payload: ResponsesApiRequest } {
   if (typeof payload.input === "string") {
-    return { bodyLength: JSON.stringify(payload).length, count: 0, payload }
+    return { bodyLength: jsonByteLength(payload), count: 0, payload }
   }
 
   const input = [...payload.input]
-  let bodyLength = JSON.stringify({ ...payload, input }).length
+  let bodyLength = jsonByteLength({ ...payload, input })
   let count = 0
 
   for (let index = 0; index < input.length && bodyLength > ceiling; index++) {
@@ -465,7 +453,7 @@ function dropOldInputItems(
 
     input[index] = createDroppedInputItem(item)
     count++
-    bodyLength = JSON.stringify({ ...payload, input }).length
+    bodyLength = jsonByteLength({ ...payload, input })
   }
 
   return { bodyLength, count, payload: { ...payload, input } }
@@ -537,14 +525,14 @@ function truncateLargestInputContent(
   }
 
   let current = payload
-  let bodyLength = JSON.stringify(current).length
+  let bodyLength = jsonByteLength(current)
 
   while (bodyLength > ceiling) {
     const target = findLargestInputString(current)
     if (!target) return current
 
     current = truncateStringAtLocation(current, target, bodyLength - ceiling)
-    const nextBodyLength = JSON.stringify(current).length
+    const nextBodyLength = jsonByteLength(current)
     if (nextBodyLength >= bodyLength) return current
     bodyLength = nextBodyLength
   }
@@ -552,10 +540,8 @@ function truncateLargestInputContent(
   return current
 }
 
-interface StringLocation {
+interface StringLocation extends StringCandidate {
   inputIndex: number
-  length: number
-  path: Array<number | string>
 }
 
 function findLargestInputString(
@@ -584,16 +570,10 @@ function truncateStringAtLocation(
   if (typeof payload.input === "string") return payload
 
   const input = [...payload.input]
-  const item = input[location.inputIndex]
-  const keepLength = Math.max(
-    0,
-    location.length - excessBytes - INPUT_TRUNCATED_PREFIX.length - 10_000,
-  )
-
   input[location.inputIndex] = truncateStringAtPath(
-    item,
+    input[location.inputIndex],
     location.path,
-    keepLength,
+    excessBytes,
   ) as ResponsesInputItem
   return { ...payload, input }
 }
@@ -638,25 +618,29 @@ function findLargestStringInValue(
 function truncateStringAtPath(
   value: unknown,
   path: Array<number | string>,
-  keepLength: number,
+  excessBytes: number,
 ): unknown {
   if (path.length === 0) {
     if (typeof value !== "string") return value
-    return INPUT_TRUNCATED_PREFIX + value.slice(-keepLength)
+    return truncateJsonString(
+      value,
+      jsonByteLength(value) - excessBytes,
+      INPUT_TRUNCATED_PREFIX,
+    )
   }
 
   const [head, ...tail] = path
   if (Array.isArray(value) && typeof head === "number") {
     const arrayValue = value as Array<unknown>
     const next = [...arrayValue]
-    next[head] = truncateStringAtPath(next[head], tail, keepLength)
+    next[head] = truncateStringAtPath(next[head], tail, excessBytes)
     return next
   }
 
   if (isRecord(value) && typeof head === "string") {
     return {
       ...value,
-      [head]: truncateStringAtPath(value[head], tail, keepLength),
+      [head]: truncateStringAtPath(value[head], tail, excessBytes),
     }
   }
 
@@ -695,7 +679,7 @@ function truncateLargestPayloadStrings(
   ceiling: number,
 ): ResponsesApiRequest {
   let current = payload
-  let bodyLength = JSON.stringify(current).length
+  let bodyLength = jsonByteLength(current)
 
   while (bodyLength > ceiling) {
     const target = findLargestStringInValue(current, [])
@@ -706,7 +690,7 @@ function truncateLargestPayloadStrings(
       target.path,
       bodyLength - ceiling,
     ) as ResponsesApiRequest
-    const nextBodyLength = JSON.stringify(current).length
+    const nextBodyLength = jsonByteLength(current)
     if (nextBodyLength >= bodyLength) return current
     bodyLength = nextBodyLength
   }
@@ -989,10 +973,13 @@ function hasInvalidImageUrl(part: { image_url?: unknown }): boolean {
   ) {
     return false
   }
-  return typeof part.image_url !== "string" || !isValidHttpUrl(part.image_url)
+  return typeof part.image_url !== "string" || !isValidImageUrl(part.image_url)
 }
 
-function isValidHttpUrl(value: string): boolean {
+function isValidImageUrl(value: string): boolean {
+  // MCP tools return inline images as base64 data URLs.
+  if (/^data:image\/[a-z\d.+-]+;base64,./i.test(value)) return true
+
   try {
     const url = new URL(value)
     return url.protocol === "http:" || url.protocol === "https:"
@@ -1004,9 +991,11 @@ function isValidHttpUrl(value: string): boolean {
 function responsesPayloadHasImages(payload: ResponsesApiRequest): boolean {
   if (typeof payload.input === "string") return false
 
-  return payload.input.some(
-    (item) =>
-      Array.isArray(item.content)
-      && item.content.some((part) => part.type === "input_image"),
+  return payload.input.some((item) =>
+    [item.content, item.output].some(
+      (parts) =>
+        Array.isArray(parts)
+        && parts.some((part) => part.type === "input_image"),
+    ),
   )
 }

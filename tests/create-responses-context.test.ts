@@ -10,8 +10,8 @@ import { createResponses } from "~/services/copilot/create-responses"
  *
  * The proxy forwards client history verbatim by default and lets Copilot
  * enforce its own token limits, so a rejection reflects upstream's real answer
- * instead of a local estimate. Only the ~5 MB Azure Front Door transport cliff
- * is enforced pre-flight, because that one is a verified wire limit.
+ * instead of a local estimate. A configurable local payload budget defaults
+ * to 10 MB and is enforced before sending the request.
  */
 
 state.copilotToken = "test-token"
@@ -57,8 +57,8 @@ function bodyToString(body: unknown): string {
 }
 
 test("forwards oversized history unchanged by default", async () => {
-  // Well over the old token-derived ceiling (924_000) but under the 5 MB
-  // transport cliff: previously this was silently rewritten before Copilot
+  // Well over the old token-derived ceiling (924_000) but under the 10 MB
+  // default local budget: previously this was silently rewritten before Copilot
   // ever saw it. The client's conversation must now reach upstream intact.
   const payload: ResponsesApiRequest = {
     model: "gpt-5.5",
@@ -93,12 +93,12 @@ test("forwards oversized history unchanged by default", async () => {
   }
 })
 
-test("still enforces the hard transport ceiling without the flag", async () => {
+test("still enforces the local payload ceiling without token trimming", async () => {
   const payload: ResponsesApiRequest = {
     model: "gpt-5.5",
     input: Array.from({ length: 12 }, (_, index) => ({
       role: "user",
-      content: `Huge ${index}\n${"x".repeat(600_000)}`,
+      content: `Huge ${index}\n${"x".repeat(900_000)}`,
     })),
   }
 
@@ -114,9 +114,8 @@ test("still enforces the hard transport ceiling without the flag", async () => {
   await createResponses(payload)
   const sentBody = bodyToString(fetchMock.mock.calls[0][1].body)
 
-  // Azure Front Door rejects above ~5.4 MB regardless of tokens, so this
-  // ceiling is a verified wire limit rather than an estimate.
-  expect(sentBody.length).toBeLessThanOrEqual(5_000_000)
+  // The default local budget applies independently of token-derived trimming.
+  expect(sentBody.length).toBeLessThanOrEqual(10_000_000)
 })
 
 test("surfaces upstream token counts instead of a local estimate", async () => {

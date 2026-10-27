@@ -20,6 +20,9 @@ export interface State {
    */
   responsesContextTrim: boolean
 
+  /** Local byte ceiling for requests forwarded through the Responses API. */
+  responsesMaxPayloadBytes: number
+
   // Rate limiting configuration
   rateLimitSeconds?: number
   lastRequestTimestamp?: number
@@ -32,4 +35,5 @@ export const state: State = {
   showToken: false,
   localApiKeys: [],
   responsesContextTrim: false,
+  responsesMaxPayloadBytes: 10_000_000,
 }
